@@ -45,17 +45,15 @@
 #include <unistd.h>
 #include <errno.h>
 
-static int send_socket, sniff_socket;
-
 /* Fake header.  */
 struct timestamp_hdr {
-	uint32_t origin;
+	uint32_t orig;
 	uint32_t recv;
-	uint32_t transmit;
+	uint32_t xmit;
 };
 
 #define SNIFF_TIMEOUT		100
-#define IP_ICMP_COMBINED	sizeof(struct iphdr) + sizeof(struct icmphdr)
+#define IP_ICMP_COMBINED 	sizeof(struct iphdr) + sizeof(struct icmphdr)
 #define PACKET_LENGTH		IP_ICMP_COMBINED + sizeof(struct timestamp_hdr)
 
 struct packet {
@@ -65,7 +63,7 @@ struct packet {
 	uint8_t buf[PACKET_LENGTH];
 };
 
-static bool next_packet(struct packet *p)
+static bool next_packet(int fd, struct packet *p)
 {
 	struct sockaddr_ll fromaddr;
 	socklen_t fromlen = sizeof(fromaddr);
@@ -75,19 +73,19 @@ static bool next_packet(struct packet *p)
 	int c;
 
 	FD_ZERO(&fdset);
-	FD_SET(sniff_socket, &fdset);
+	FD_SET(fd, &fdset);
 
 	tv.tv_sec = 0;
 	tv.tv_usec = SNIFF_TIMEOUT * 1000;
 
 	errno = 0;
 	do
-		c = select(sniff_socket + 1, &fdset, NULL, NULL, &tv);
+		c = select(fd + 1, &fdset, NULL, NULL, &tv);
 	while (c == -1 && errno == EINTR);
-	if (c == -1 || !FD_ISSET(sniff_socket, &fdset))
+	if (c == -1 || !FD_ISSET(fd, &fdset))
 		return false;
 
-	if (recvfrom(sniff_socket, p->buf, PACKET_LENGTH, 0, (struct sockaddr *)&fromaddr, &fromlen) == 0)
+	if (recvfrom(fd, p->buf, PACKET_LENGTH, 0, (struct sockaddr *)&fromaddr, &fromlen) == 0)
 		return false;
 
 	switch (fromaddr.sll_hatype) {
@@ -122,7 +120,7 @@ static bool next_packet(struct packet *p)
 
 	p->ip->tot_len = htons(p->ip->tot_len);
 	p->ip->id = htons(p->ip->id);
-	p->icmp = (struct icmphdr *)((char *)p->ip + p->ip->ihl * 4);
+	p->icmp = (struct icmphdr *)((uintptr_t)p->ip + p->ip->ihl * 4);
 	return true;
 }
 
@@ -151,7 +149,7 @@ static uint16_t hdr_checksum(register const uint16_t *buf, register int length)
 }
 
 /* send an ICMP timestamp request, returns sequence id to be matched later.   */
-static int send_icmp(uint32_t src, uint32_t dst)
+static int send_icmp(int fd, uint32_t src, uint32_t dst)
 {
 	static int last_seq = 0;
 
@@ -182,14 +180,14 @@ static int send_icmp(uint32_t src, uint32_t dst)
 	icmp->un.echo.sequence = last_seq;
 
 	struct timestamp_hdr *ts = (struct timestamp_hdr *)(packet + IP_ICMP_COMBINED);
-	ts->origin = htonl(msec_since_midnight());
+	ts->orig = htonl(msec_since_midnight());
 	ts->recv = 0;
-	ts->transmit = 0;
+	ts->xmit = 0;
 
 	/* ICMP checksum  */
 	icmp->checksum = hdr_checksum((const uint16_t *)icmp, sizeof(*icmp) + sizeof(*ts));
 
-	int s = sendto(send_socket, packet, PACKET_LENGTH, 0, (struct sockaddr *)&to, sizeof(struct sockaddr));
+	int s = sendto(fd, packet, PACKET_LENGTH, 0, (struct sockaddr *)&to, sizeof(struct sockaddr));
 	free(packet);
 
 	if (s != PACKET_LENGTH) {
@@ -223,12 +221,12 @@ static bool process_packet(const struct packet *p, uint32_t src, uint32_t dst, i
 		return false;
 	}
 
-	struct timestamp_hdr *ts = (struct timestamp_hdr *)((char *)p->buf + p->off + IP_ICMP_COMBINED);
-	printf("reply: tot: %d origin %d recv %d transmit %d\n",
+	struct timestamp_hdr *ts = (struct timestamp_hdr *)((uintptr_t)icmp + sizeof(*icmp));
+	printf("reply: tot: %d orig %d recv %d xmit %d\n",
 			ip->tot_len,
-			ntohl(ts->origin),
+			ntohl(ts->orig),
 			ntohl(ts->recv),
-			ntohl(ts->transmit));
+			ntohl(ts->xmit));
 	return true;
 }
 
@@ -246,27 +244,15 @@ int main(int argc, char *argv[])
 	char *source = argv[2];
 	char *target = argv[3];
 	int ret = 1;
+	int fd;
 
-	sniff_socket = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-	if (sniff_socket < 0) {
-		fprintf(stderr, "%s: failed to create sniff socket, are you root?\n",
-				argv[0]);
-		return 1;
-	}
-
-	if (setsockopt(sniff_socket, SOL_SOCKET, SO_BINDTODEVICE, iface, strlen(iface)) == -1) {
-		fprintf(stderr, "%s: failed to bind sniff socket to interface %s\n",
-				argv[0], iface);
-		goto err;
-	}
-
-	send_socket = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-	if (send_socket < 0) {
+	fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	if (fd < 0) {
 		fprintf(stderr, "%s: failed to create send socket!\n", argv[0]);
 		return 1;
 	}
 
-	if (setsockopt(send_socket, SOL_SOCKET, SO_BINDTODEVICE, iface, strlen(iface)) == -1) {
+	if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, iface, strlen(iface)) == -1) {
 		fprintf(stderr, "%s: failed to bind send socket to interface %s\n",
 				argv[0], iface);
 		goto err;
@@ -276,21 +262,21 @@ int main(int argc, char *argv[])
 	 * the kernel will put it's own header in there.
 	 * just warn and keep going.  */
 	int inc_hdr = 1;
-	if (setsockopt(send_socket, IPPROTO_IP, IP_HDRINCL, (char *)&inc_hdr, sizeof(inc_hdr)) == -1) {
+	if (setsockopt(fd, IPPROTO_IP, IP_HDRINCL, (char *)&inc_hdr, sizeof(inc_hdr)) == -1) {
 		fprintf(stderr, "%s: warning: failed to set flag include header on send socket\n",
 				argv[0]);
 	}
 
 	uint32_t src = inet_addr(source);
 	uint32_t dst = inet_addr(target);
-	ret = send_icmp(src, dst);
+	ret = send_icmp(fd, src, dst);
 	if (ret < 0)
 		goto err;
 
 	/* Wait for response.  */
 	struct packet p;
 	for (;;) {
-		if (!next_packet(&p)) {
+		if (!next_packet(fd, &p)) {
 			fprintf(stderr, "unable to sniff packet, sleeping\n");
 			usleep(10000);
 			continue;
@@ -306,8 +292,7 @@ int main(int argc, char *argv[])
 	}
 
 err:
-	close(sniff_socket);
-	close(send_socket);
+	close(fd);
 	return ret;
 }
 
