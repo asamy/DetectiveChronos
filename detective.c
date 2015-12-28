@@ -153,7 +153,7 @@ static int send_icmp(int fd, uint32_t src, uint32_t dst)
 {
 	static int last_seq = 0;
 
-	char *packet = calloc(PACKET_LENGTH, 1);
+	char *packet = malloc(PACKET_LENGTH);
 	if (!packet)
 		return -1;
 
@@ -171,6 +171,9 @@ static int send_icmp(int fd, uint32_t src, uint32_t dst)
 	ip->protocol = IPPROTO_ICMP;
 	ip->saddr = src;
 	ip->daddr = dst;
+
+	/* IP checksum  */
+	ip->check = 0;
 	ip->check = hdr_checksum((const uint16_t *)ip, sizeof(struct iphdr));
 
 	struct icmphdr *icmp = (struct icmphdr *)(packet + sizeof(struct iphdr));
@@ -185,6 +188,7 @@ static int send_icmp(int fd, uint32_t src, uint32_t dst)
 	ts->xmit = 0;
 
 	/* ICMP checksum  */
+	icmp->checksum = 0;
 	icmp->checksum = hdr_checksum((const uint16_t *)icmp, sizeof(*icmp) + sizeof(*ts));
 
 	int s = sendto(fd, packet, PACKET_LENGTH, 0, (struct sockaddr *)&to, sizeof(struct sockaddr));
