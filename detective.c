@@ -53,8 +53,9 @@ struct timestamp_hdr {
 };
 
 #define SNIFF_TIMEOUT		100
-#define IP_ICMP_COMBINED 	sizeof(struct iphdr) + sizeof(struct icmphdr)
-#define PACKET_LENGTH		IP_ICMP_COMBINED + sizeof(struct timestamp_hdr)
+#define PACKET_LENGTH 		sizeof(struct iphdr)		\
+			      + sizeof(struct icmphdr)		\
+			      + sizeof(struct timestamp_hdr)
 
 struct packet {
 	struct iphdr *ip;
@@ -182,7 +183,7 @@ static int send_icmp(int fd, uint32_t src, uint32_t dst)
 	icmp->un.echo.id = 0x3F5F;
 	icmp->un.echo.sequence = last_seq;
 
-	struct timestamp_hdr *ts = (struct timestamp_hdr *)(packet + IP_ICMP_COMBINED);
+	struct timestamp_hdr *ts = (struct timestamp_hdr *)((uintptr_t)icmp + sizeof(*icmp));
 	ts->orig = htonl(msec_since_midnight());
 	ts->recv = 0;
 	ts->xmit = 0;
